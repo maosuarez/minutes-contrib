@@ -7,10 +7,20 @@ use crate::pipeline::{self, BackgroundPipelineContext, PipelineStage};
 use chrono::{DateTime, Local};
 use serde_json::json;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Sentinel filename inside `jobs_dir()` recording that the one-shot upgrade
+/// migration of pre-existing terminal jobs into `archive/` has run. Sentinel
+/// file rather than a `OnceLock` because (a) the marker survives process
+/// restarts so a CLI invocation followed by an app launch don't both run the
+/// sweep, and (b) per-test temp `HOME`s get fresh migration semantics
+/// without sharing process-global state. Bumped if the migration ever needs
+/// to re-run for a future schema change.
+const MIGRATION_MARKER: &str = ".archive-initialized-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -191,12 +201,32 @@ pub fn jobs_dir() -> PathBuf {
     Config::minutes_dir().join("jobs")
 }
 
+/// Subdirectory inside `jobs/` that holds finalized (Complete/Failed/NeedsReview)
+/// job records. Terminal jobs are moved here on state transition so the
+/// hot-path `list_jobs_raw` scan never has to read or parse them — one
+/// directory walk + N small JSON parses per UI status poll otherwise scales
+/// linearly with the user's lifetime meeting count.
+///
+/// The boundary is enforced by `update_job_state` (write-then-`hard_link`-
+/// then-unlink for to-terminal, write-new-then-remove-old for from-terminal;
+/// see `move_to_archive` for why we use `hard_link` instead of `rename`)
+/// and by a one-shot lazy migration of pre-existing terminal jobs (see
+/// `migrate_terminal_jobs_to_archive`).
+pub fn archive_dir() -> PathBuf {
+    jobs_dir().join("archive")
+}
+
 pub fn worker_pid_path() -> PathBuf {
     Config::minutes_dir().join("processing-worker.pid")
 }
 
 pub fn job_path(job_id: &str) -> PathBuf {
     jobs_dir().join(format!("{}.json", job_id))
+}
+
+/// Path of a job's archived JSON (after terminal state transition).
+pub fn job_archive_path(job_id: &str) -> PathBuf {
+    archive_dir().join(format!("{}.json", job_id))
 }
 
 pub fn job_capture_path(job_id: &str) -> PathBuf {
@@ -420,34 +450,62 @@ fn maybe_mark_context_session_failed(
 }
 
 pub fn write_job(job: &ProcessingJob) -> std::io::Result<()> {
-    let path = job_path(&job.id);
-    if let Some(parent) = path.parent() {
+    write_job_to(job, &job_path(&job.id))
+}
+
+/// Atomically write a job's JSON to the given destination path (temp file +
+/// rename). Used by `write_job` (always active path) and by `update_job_state`
+/// when a state transition crosses the active/archive boundary.
+fn write_job_to(job: &ProcessingJob, dest: &Path) -> std::io::Result<()> {
+    if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("json.tmp");
+    let tmp = dest.with_extension("json.tmp");
     let json = serde_json::to_string_pretty(job)?;
     fs::write(&tmp, json)?;
-    fs::rename(tmp, path)?;
+    fs::rename(tmp, dest)?;
     Ok(())
 }
 
 pub fn load_job(job_id: &str) -> Option<ProcessingJob> {
-    let path = job_path(job_id);
-    if !path.exists() {
-        return None;
+    load_job_with_source(job_id).map(|(job, _)| job)
+}
+
+/// Load a job and return the path it was loaded from. Active dir is checked
+/// first so the common (in-flight) case stays single-stat; the archive is the
+/// fallback.
+///
+/// The returned path is what `update_job_state` uses to decide whether a
+/// state transition crosses the active/archive boundary — the file's actual
+/// current location is the source of truth, not what its `state` field
+/// implies (which can disagree mid-update).
+fn load_job_with_source(job_id: &str) -> Option<(ProcessingJob, PathBuf)> {
+    let active = job_path(job_id);
+    if let Ok(text) = fs::read_to_string(&active) {
+        if let Ok(job) = serde_json::from_str::<ProcessingJob>(&text) {
+            return Some((job, active));
+        }
     }
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<ProcessingJob>(&text).ok())
+    let archive = job_archive_path(job_id);
+    if let Ok(text) = fs::read_to_string(&archive) {
+        if let Ok(job) = serde_json::from_str::<ProcessingJob>(&text) {
+            return Some((job, archive));
+        }
+    }
+    None
 }
 
 fn list_jobs_raw() -> Vec<ProcessingJob> {
+    ensure_archive_initialized();
     let mut jobs = Vec::new();
     let dir = jobs_dir();
     if !dir.exists() {
         return jobs;
     }
 
+    // Only top-level `.json` files. The `archive/` subdir entry has no
+    // `.json` extension and is skipped by the filter below; this is the
+    // critical guarantee that terminal jobs stay off the hot path.
     for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
@@ -462,6 +520,161 @@ fn list_jobs_raw() -> Vec<ProcessingJob> {
 
     jobs.sort_by_key(|job| job.created_at);
     jobs
+}
+
+/// List archived (terminal-state) jobs from `archive_dir`. Used by
+/// `display_jobs(_, include_terminal=true)` for full UI listings; never
+/// called from the 1Hz status poll path.
+fn list_archive_jobs() -> Vec<ProcessingJob> {
+    // Defensive — `display_jobs` already triggers migration via list_jobs(),
+    // but a future caller hitting this directly would otherwise miss the
+    // upgrade sweep on a pre-migration install.
+    ensure_archive_initialized();
+    let dir = archive_dir();
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let mut jobs = Vec::new();
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        if let Ok(text) = fs::read_to_string(&path) {
+            if let Ok(job) = serde_json::from_str::<ProcessingJob>(&text) {
+                jobs.push(job);
+            }
+        }
+    }
+    jobs
+}
+
+/// Run the one-shot upgrade migration unless the sentinel marker says it
+/// already happened in this `~/.minutes/` installation. The marker survives
+/// process restarts; tests get fresh state because each `with_temp_home`
+/// gives them an isolated `~/.minutes/`.
+fn ensure_archive_initialized() {
+    let marker = jobs_dir().join(MIGRATION_MARKER);
+    if marker.exists() {
+        return;
+    }
+    if let Err(error) = migrate_terminal_jobs_to_archive() {
+        tracing::warn!(error = %error, "jobs archive migration failed");
+        return;
+    }
+    if let Err(error) = fs::write(&marker, b"v1") {
+        tracing::warn!(
+            error = %error,
+            "failed to write archive migration marker; sweep will retry next call"
+        );
+    }
+}
+
+/// Sweep pre-existing terminal jobs from `jobs/` into `jobs/archive/`.
+///
+/// Idempotent and race-tolerant. The critical correctness property: when two
+/// processes race the same job, neither can clobber the canonical archive
+/// copy with stale content. Achieved via `fs::hard_link` — POSIX `rename(2)`
+/// silently overwrites the destination, so `fs::rename` is unsafe here even
+/// though it would otherwise be the natural primitive.
+///
+/// `fs::hard_link` reserves the dest path atomically: it succeeds only when
+/// dest does not exist, returning `AlreadyExists` otherwise. After a
+/// successful link, source and dest point to the same inode, so removing
+/// source completes the move. If the link fails because dest already
+/// exists, we trust the existing archive copy (placed there by another
+/// process or a prior migration) and drop the active duplicate.
+fn migrate_terminal_jobs_to_archive() -> std::io::Result<()> {
+    let active = jobs_dir();
+    if !active.exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(archive_dir())?;
+
+    for entry in fs::read_dir(&active).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        // Mirror the prior `list_jobs_raw` behavior: read_to_string fails
+        // for directories or unreadable entries, so no separate is_file()
+        // check (which would silently skip valid `.json` symlinks).
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(job) = serde_json::from_str::<ProcessingJob>(&text) else {
+            continue;
+        };
+        if !job.state.is_terminal() {
+            continue;
+        }
+        let dest = job_archive_path(&job.id);
+        if let Err(error) = move_to_archive(&path, &dest) {
+            tracing::warn!(
+                job_id = %job.id,
+                error = %error,
+                "migrate: failed to move job to archive"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Move a job JSON file from active to archive with `AlreadyExists`
+/// detection. Used by both the upgrade migration and `update_job_state`'s
+/// to-archive transition. The hard-link-then-unlink dance prevents the
+/// `fs::rename` silent-overwrite hazard described above.
+fn move_to_archive(source: &Path, dest: &Path) -> std::io::Result<()> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::hard_link(source, dest) {
+        Ok(()) => {
+            // Both names point to the same inode — drop the active name.
+            if let Err(error) = fs::remove_file(source) {
+                if error.kind() != ErrorKind::NotFound {
+                    tracing::warn!(
+                        source = %source.display(),
+                        error = %error,
+                        "move_to_archive: failed to remove source after link"
+                    );
+                }
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            // A concurrent process or earlier run already archived this
+            // job. Trust the existing archive copy and drop our active
+            // duplicate — losing our potentially-stale update is the
+            // correct behavior (the on-disk archive is the canonical
+            // version; ours may have been built from an older snapshot).
+            tracing::debug!(
+                source = %source.display(),
+                dest = %dest.display(),
+                "archive already populated; dropping active duplicate"
+            );
+            if let Err(remove_error) = fs::remove_file(source) {
+                if remove_error.kind() != ErrorKind::NotFound {
+                    tracing::warn!(
+                        source = %source.display(),
+                        error = %remove_error,
+                        "move_to_archive: failed to drop duplicate"
+                    );
+                }
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            // Source disappeared mid-flight (concurrent migration moved
+            // it). If dest exists, treat as success; otherwise propagate.
+            if dest.exists() {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub fn list_jobs() -> Vec<ProcessingJob> {
@@ -494,6 +707,11 @@ pub fn list_jobs() -> Vec<ProcessingJob> {
 
 pub fn display_jobs(limit: Option<usize>, include_terminal: bool) -> Vec<ProcessingJob> {
     let mut jobs = list_jobs();
+    if include_terminal {
+        // The hot path (`list_jobs_raw`) skips the archive subdir entirely.
+        // Full UI listings still want terminal history, so pull it in here.
+        jobs.extend(list_archive_jobs());
+    }
     jobs.sort_by(|a, b| {
         job_sort_bucket(a)
             .cmp(&job_sort_bucket(b))
@@ -588,15 +806,80 @@ pub fn next_pending_job() -> Option<ProcessingJob> {
         .find(|job| job.state == JobState::Queued)
 }
 
+/// Atomically update a job's state, moving the file across the
+/// active/archive boundary if (and only if) the state transition crosses it.
+///
+/// Boundary logic, per the codex review of fix B:
+/// * **Same dir** (active→active or archive→archive): atomic write to the
+///   destination via `write_job_to`.
+/// * **Active → archive** (job became terminal): write the updated JSON to
+///   the active path first, then call `move_to_archive` (which uses
+///   `hard_link` + `remove_file` rather than `rename` so we never silently
+///   clobber an existing archive copy on a race). If the move fails, the
+///   job stays in active with its terminal state — `display_jobs(_, false)`
+///   filters terminal jobs out so this is invisible to the user; the file
+///   is in the wrong place but not duplicated and gets re-tried next update.
+/// * **Archive → active** (requeue): write the new (non-terminal) JSON
+///   directly to the active path, then remove the archive copy. If the
+///   write fails, the archive copy preserves the original terminal state
+///   and the caller surfaces the error. If the remove fails, both copies
+///   exist briefly — `load_job_with_source` checks active first so the
+///   non-terminal record wins lookups; the leftover archive copy is
+///   reaped on the next update touching this job.
 pub fn update_job_state<F>(job_id: &str, update: F) -> std::io::Result<Option<ProcessingJob>>
 where
     F: FnOnce(&mut ProcessingJob),
 {
-    let Some(mut job) = load_job(job_id) else {
+    let Some((mut job, source)) = load_job_with_source(job_id) else {
         return Ok(None);
     };
     update(&mut job);
-    write_job(&job)?;
+
+    let dest = if job.state.is_terminal() {
+        job_archive_path(&job.id)
+    } else {
+        job_path(&job.id)
+    };
+
+    if source == dest {
+        write_job_to(&job, &dest)?;
+        return Ok(Some(job));
+    }
+
+    let source_in_active = source == job_path(&job.id);
+
+    if !source_in_active {
+        // Archive → active (requeue). Write new state to active first;
+        // archive copy preserves the original until removal succeeds.
+        write_job_to(&job, &dest)?;
+        if let Err(e) = fs::remove_file(&source) {
+            if e.kind() != ErrorKind::NotFound {
+                tracing::warn!(
+                    job_id = %job.id,
+                    error = %e,
+                    "update_job_state: failed to remove archive copy after requeue"
+                );
+            }
+        }
+        return Ok(Some(job));
+    }
+
+    // Active → archive (job became terminal). Write updated JSON to the
+    // active path first so the on-disk record matches what we hand back;
+    // then move it into archive via `move_to_archive` (hard_link + unlink,
+    // which surfaces AlreadyExists rather than silently overwriting). If
+    // the move fails for an unexpected reason, the terminal-state record
+    // sits in the active dir — `display_jobs(_, false)` filters terminal
+    // jobs out so this is invisible to the user; self-healing on the next
+    // update.
+    write_job_to(&job, &source)?;
+    if let Err(error) = move_to_archive(&source, &dest) {
+        tracing::warn!(
+            job_id = %job.id,
+            error = %error,
+            "update_job_state: move_to_archive failed (job stays in active dir but is terminal-state)"
+        );
+    }
     Ok(Some(job))
 }
 
@@ -1386,6 +1669,283 @@ mod tests {
             let summary = processing_summary().unwrap();
             assert_eq!(summary.id, "job-active");
             assert_eq!(summary.state, JobState::Transcribing);
+        });
+    }
+
+    /// Build a `ProcessingJob` with sensible defaults, used by the archive-
+    /// partition tests below. Inline struct literals are common in this file
+    /// for readability of older tests; keeping a helper local to the new
+    /// suite avoids drift while not refactoring the existing fixtures.
+    fn make_test_job(id: &str, state: JobState) -> ProcessingJob {
+        ProcessingJob {
+            id: id.into(),
+            mode: CaptureMode::Meeting,
+            content_type: ContentType::Meeting,
+            title: Some(format!("title-{id}")),
+            audio_path: format!("/tmp/{id}.wav"),
+            output_path: None,
+            state,
+            stage: state.default_stage(),
+            created_at: Local::now(),
+            started_at: None,
+            finished_at: None,
+            notice_dismissed_at: None,
+            recording_started_at: None,
+            recording_finished_at: None,
+            context_session_id: None,
+            user_notes: None,
+            pre_context: None,
+            calendar_event: None,
+            template_slug: None,
+            recording_health: None,
+            word_count: None,
+            error: None,
+            owner_pid: None,
+        }
+    }
+
+    #[test]
+    fn migration_moves_terminal_jobs_to_archive() {
+        with_temp_home(|_| {
+            let terminal = make_test_job("job-old-complete", JobState::Complete);
+            let queued = make_test_job("job-still-queued", JobState::Queued);
+            // write_job always targets active dir — simulates a pre-upgrade
+            // user with terminal jobs cluttering the hot path.
+            write_job(&terminal).unwrap();
+            write_job(&queued).unwrap();
+            assert!(job_path(&terminal.id).exists());
+
+            migrate_terminal_jobs_to_archive().unwrap();
+
+            assert!(
+                !job_path(&terminal.id).exists(),
+                "terminal job should be moved out of active dir"
+            );
+            assert!(
+                job_archive_path(&terminal.id).exists(),
+                "terminal job should now live in archive"
+            );
+            assert!(
+                job_path(&queued.id).exists(),
+                "queued job stays in active dir"
+            );
+        });
+    }
+
+    #[test]
+    fn migration_is_idempotent_when_already_archived() {
+        with_temp_home(|_| {
+            let job = make_test_job("job-double-migrate", JobState::Failed);
+            // Pre-existing archive copy (e.g. from an earlier migration in
+            // another process, or from update_job_state). Migrate again with
+            // the same job sitting in active — must not corrupt state.
+            fs::create_dir_all(archive_dir()).unwrap();
+            write_job_to(&job, &job_archive_path(&job.id)).unwrap();
+            write_job(&job).unwrap();
+
+            migrate_terminal_jobs_to_archive().unwrap();
+
+            // Active copy is gone; archive remains and parses cleanly.
+            assert!(!job_path(&job.id).exists());
+            assert!(job_archive_path(&job.id).exists());
+            let loaded = load_job(&job.id).unwrap();
+            assert_eq!(loaded.state, JobState::Failed);
+        });
+    }
+
+    #[test]
+    fn move_to_archive_preserves_canonical_copy_on_already_exists() {
+        // Critical correctness test: `fs::rename` silently overwrites the
+        // destination on POSIX. We must not lose the canonical archive copy
+        // when a stale-snapshot updater races against an already-archived
+        // job. `move_to_archive` uses `fs::hard_link` to detect the conflict
+        // and drops the active-side duplicate instead.
+        with_temp_home(|_| {
+            let job_id = "job-race";
+            let canonical = make_test_job(job_id, JobState::Complete);
+            // Canonical archive copy — represents what another process
+            // wrote at T1.
+            fs::create_dir_all(archive_dir()).unwrap();
+            write_job_to(&canonical, &job_archive_path(job_id)).unwrap();
+            // Stale active copy — represents what process A would write at
+            // T2 from a snapshot loaded before T1. Different state to make
+            // the data-loss case observable: if rename clobbered, the
+            // archive would now contain Failed instead of Complete.
+            let mut stale = make_test_job(job_id, JobState::Failed);
+            stale.error = Some("stale snapshot".into());
+            write_job(&stale).unwrap();
+
+            move_to_archive(&job_path(job_id), &job_archive_path(job_id)).unwrap();
+
+            assert!(
+                !job_path(job_id).exists(),
+                "active duplicate must be dropped after race detection"
+            );
+            let archived = load_job(job_id).unwrap();
+            assert_eq!(
+                archived.state,
+                JobState::Complete,
+                "canonical archive copy must survive the race"
+            );
+            assert!(
+                archived.error.is_none(),
+                "stale state must not have leaked into archive"
+            );
+        });
+    }
+
+    #[test]
+    fn ensure_archive_initialized_writes_marker_and_skips_on_repeat() {
+        with_temp_home(|_| {
+            let terminal = make_test_job("job-marker", JobState::Complete);
+            write_job(&terminal).unwrap();
+            assert!(!jobs_dir().join(MIGRATION_MARKER).exists());
+
+            ensure_archive_initialized();
+
+            assert!(
+                jobs_dir().join(MIGRATION_MARKER).exists(),
+                "marker should be written after a successful sweep"
+            );
+            assert!(job_archive_path(&terminal.id).exists());
+
+            // Second call is a no-op — drop a fresh terminal job into
+            // active and confirm the marker prevents re-migration.
+            let later = make_test_job("job-after-marker", JobState::Failed);
+            write_job(&later).unwrap();
+            ensure_archive_initialized();
+            assert!(
+                job_path(&later.id).exists(),
+                "post-marker terminal jobs are routed by update_job_state, not by migration"
+            );
+        });
+    }
+
+    #[test]
+    fn update_job_state_moves_to_archive_on_terminal_transition() {
+        with_temp_home(|_| {
+            let job = make_test_job("job-becoming-terminal", JobState::Transcribing);
+            write_job(&job).unwrap();
+            assert!(job_path(&job.id).exists());
+            assert!(!job_archive_path(&job.id).exists());
+
+            update_job_state(&job.id, |j| j.state = JobState::Complete)
+                .unwrap()
+                .unwrap();
+
+            assert!(
+                !job_path(&job.id).exists(),
+                "terminal job should leave active dir on transition"
+            );
+            assert!(
+                job_archive_path(&job.id).exists(),
+                "terminal job should land in archive"
+            );
+            // The on-disk record reflects the new state.
+            let loaded = load_job(&job.id).unwrap();
+            assert_eq!(loaded.state, JobState::Complete);
+        });
+    }
+
+    #[test]
+    fn update_job_state_moves_back_to_active_on_requeue() {
+        with_temp_home(|_| {
+            // Set up: terminal job already in archive (the steady-state shape
+            // after either migration or a normal terminal transition).
+            let job = make_test_job("job-requeue", JobState::Failed);
+            fs::create_dir_all(archive_dir()).unwrap();
+            write_job_to(&job, &job_archive_path(&job.id)).unwrap();
+
+            update_job_state(&job.id, |j| {
+                j.state = JobState::Queued;
+                j.error = None;
+            })
+            .unwrap()
+            .unwrap();
+
+            assert!(
+                job_path(&job.id).exists(),
+                "requeued job should land back in active dir"
+            );
+            assert!(
+                !job_archive_path(&job.id).exists(),
+                "archive copy should be cleaned up after requeue"
+            );
+            let loaded = load_job(&job.id).unwrap();
+            assert_eq!(loaded.state, JobState::Queued);
+            assert_eq!(loaded.error, None);
+        });
+    }
+
+    #[test]
+    fn update_job_state_no_move_when_dir_unchanged() {
+        with_temp_home(|_| {
+            // Active → active (transitioning between non-terminal states).
+            let job = make_test_job("job-no-move", JobState::Queued);
+            write_job(&job).unwrap();
+
+            update_job_state(&job.id, |j| j.state = JobState::Transcribing)
+                .unwrap()
+                .unwrap();
+
+            assert!(job_path(&job.id).exists());
+            assert!(!job_archive_path(&job.id).exists());
+            assert_eq!(load_job(&job.id).unwrap().state, JobState::Transcribing);
+        });
+    }
+
+    #[test]
+    fn load_job_finds_archived_jobs_via_fallback() {
+        with_temp_home(|_| {
+            let job = make_test_job("job-only-in-archive", JobState::Complete);
+            fs::create_dir_all(archive_dir()).unwrap();
+            write_job_to(&job, &job_archive_path(&job.id)).unwrap();
+
+            let loaded = load_job(&job.id).unwrap();
+            assert_eq!(loaded.id, job.id);
+            assert_eq!(loaded.state, JobState::Complete);
+        });
+    }
+
+    #[test]
+    fn list_jobs_raw_does_not_see_archive_subdir() {
+        with_temp_home(|_| {
+            let active_job = make_test_job("job-active-list", JobState::Transcribing);
+            let archived_job = make_test_job("job-archived-list", JobState::Complete);
+            write_job(&active_job).unwrap();
+            fs::create_dir_all(archive_dir()).unwrap();
+            write_job_to(&archived_job, &job_archive_path(&archived_job.id)).unwrap();
+
+            let raw = list_jobs_raw();
+            let ids: Vec<&str> = raw.iter().map(|j| j.id.as_str()).collect();
+            assert!(ids.contains(&"job-active-list"));
+            assert!(
+                !ids.contains(&"job-archived-list"),
+                "list_jobs_raw must skip archive subdir contents"
+            );
+        });
+    }
+
+    #[test]
+    fn display_jobs_with_terminal_includes_archive_contents() {
+        with_temp_home(|_| {
+            let active_job = make_test_job("job-active-display", JobState::Transcribing);
+            let archived_job = make_test_job("job-archived-display", JobState::Complete);
+            write_job(&active_job).unwrap();
+            fs::create_dir_all(archive_dir()).unwrap();
+            write_job_to(&archived_job, &job_archive_path(&archived_job.id)).unwrap();
+
+            // Without terminal: only active.
+            let active_only = display_jobs(None, false);
+            let active_ids: Vec<&str> = active_only.iter().map(|j| j.id.as_str()).collect();
+            assert!(active_ids.contains(&"job-active-display"));
+            assert!(!active_ids.contains(&"job-archived-display"));
+
+            // With terminal: both come back.
+            let all = display_jobs(None, true);
+            let all_ids: Vec<&str> = all.iter().map(|j| j.id.as_str()).collect();
+            assert!(all_ids.contains(&"job-active-display"));
+            assert!(all_ids.contains(&"job-archived-display"));
         });
     }
 }
