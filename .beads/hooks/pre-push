@@ -8,6 +8,20 @@
 # that twice in one session, once for site/lib/release.ts drift and once
 # for llms.txt drift. Removing the gate is cheaper than getting it right.
 
+# Run rustfmt --check first. Cheap (no compile), fail-fast, and historically
+# the gap that bit us: 2026-05-10's silero_smoothing.rs + silero_vad.rs from
+# the VAD refactor pushed three trivial rustfmt drifts (auto-fixed in 9f80407)
+# that clippy didn't catch but CI's `Format check` job did. The hook used to
+# run only clippy + drift checks; without this line, any fmt drift sails
+# through to CI red.
+echo "Running cargo fmt --check..."
+cargo fmt --all -- --check 2>&1
+if [ $? -ne 0 ]; then
+    echo ""
+    echo "Format drift — run: cargo fmt --all"
+    exit 1
+fi
+
 echo "Running clippy (--no-default-features -D warnings)..."
 cargo clippy --all --no-default-features -- -D warnings 2>&1
 if [ $? -ne 0 ]; then
