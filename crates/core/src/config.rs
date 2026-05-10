@@ -112,14 +112,17 @@ pub struct TranscriptionConfig {
     /// Silero VAD model name (resolved under model_path, e.g. "silero-v6.2.0" → ggml-silero-v6.2.0.bin).
     /// Set to empty string to disable VAD (falls back to energy-based silence stripping).
     pub vad_model: String,
-    /// VAD engine for the recording sidecar. Accepted: `"whisper-silero"`
-    /// (default; uses whisper-rs's bundled Silero, full-buffer rescan
-    /// per 100ms call), `"ort-silero"` (streaming Silero via ort,
-    /// O(new_audio) per call, requires the `vad-ort` build feature
-    /// AND `silero-vad-v6.2.0.onnx` in `model_path`). Unknown values
-    /// log a warning and fall through to `whisper-silero`. Energy is
-    /// the dispatcher's emergency fallback; not a user-selectable
-    /// engine here.
+    /// VAD engine for the recording sidecar. Accepted: `"ort-silero"`
+    /// (default; streaming Silero via ort, O(new_audio) per call,
+    /// requires the `vad-ort` build feature AND
+    /// `silero-vad-v6.2.0.onnx` in `model_path`), `"whisper-silero"`
+    /// (whisper-rs's bundled Silero, full-buffer rescan per 100ms
+    /// call). When `"ort-silero"` is requested but the `vad-ort`
+    /// feature is off OR the ONNX is missing, the dispatcher logs a
+    /// warning and falls through to `"whisper-silero"`. Unknown
+    /// values log and fall through to `"whisper-silero"` as well.
+    /// Energy is the dispatcher's emergency fallback; not a
+    /// user-selectable engine here.
     pub vad_engine: String,
     /// Enable noise reduction via nnnoiseless (RNNoise) before transcription.
     /// Requires the `denoise` feature flag. Default: true.
@@ -714,7 +717,7 @@ impl Default for TranscriptionConfig {
             min_words: 3,
             language: None,
             vad_model: "silero-v6.2.0".into(),
-            vad_engine: "whisper-silero".into(),
+            vad_engine: "ort-silero".into(),
             noise_reduction: true,
             parakeet_binary: "parakeet".into(),
             parakeet_model: "tdt-600m".into(),
@@ -1236,6 +1239,14 @@ mod tests {
         );
         assert_eq!(config.transcription.model, "small");
         assert_eq!(config.transcription.min_words, 3);
+        // The recording sidecar's default VAD engine is the streaming
+        // ort-Silero impl. The dispatcher falls through to whisper-Silero
+        // when the `vad-ort` build feature is off or the ONNX is missing,
+        // so users on older builds see no behavior change. Pinning the
+        // string here means a future refactor cannot silently revert
+        // the default without a failing test.
+        assert_eq!(config.transcription.vad_engine, "ort-silero");
+        assert_eq!(config.transcription.vad_model, "silero-v6.2.0");
         assert_eq!(config.transcription.parakeet_binary, "parakeet");
         assert_eq!(config.transcription.parakeet_model, "tdt-600m");
         assert_eq!(config.transcription.parakeet_boost_limit, 0);
