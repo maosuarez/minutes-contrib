@@ -7266,13 +7266,13 @@ pub async fn cmd_warm_parakeet() -> Result<serde_json::Value, String> {
         .map_err(|error| format!("warmup task failed: {}", error))?
         .map_err(|error| error.to_string())?;
 
-        return Ok(serde_json::json!({
+        Ok(serde_json::json!({
             "status": "ok",
             "backend_id": stats.backend_id,
             "model": stats.model,
             "elapsed_ms": stats.elapsed_ms,
             "used_gpu": stats.used_gpu,
-        }));
+        }))
     }
     #[cfg(not(feature = "parakeet"))]
     {

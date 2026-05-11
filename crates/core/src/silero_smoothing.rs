@@ -428,7 +428,7 @@ mod tests {
         // `>=` comparison. Drift between a `>` and `>=` here would
         // silently shift segment boundaries. Long enough run that
         // min_speech opens and we see `speaking=true`.
-        let out = run(&vec![0.2_f32; 10]);
+        let out = run(&[0.2_f32; 10]);
         assert!(
             out[5..].iter().all(|d| d.speaking),
             "exactly-at-threshold must enter segment after gate opens"

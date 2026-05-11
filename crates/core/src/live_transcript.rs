@@ -3278,8 +3278,6 @@ mod tests {
     #[test]
     #[ignore]
     fn option_a_spike_silero_state_carries_across_detect_speech_calls() {
-        use std::path::PathBuf;
-
         let model_path = dirs::home_dir()
             .unwrap()
             .join(".minutes/models/ggml-silero-v6.2.0.bin");
@@ -3399,7 +3397,7 @@ mod tests {
 
         // The test always passes; output is informational. Failing here
         // would just block the spike from running.
-        let _ = PathBuf::from(model_path);
+        let _ = model_path;
     }
 
     /// SPIKE v2 — richer probe on real speech, simulating the production
@@ -3671,6 +3669,7 @@ mod tests {
     /// Scope-warning and runtime-fallback-warning are semantically distinct:
     /// - scope = "this build doesn't support parakeet"
     /// - fallback = "parakeet failed at runtime; falling back"
+    ///
     /// If they drift to the same message, users can't distinguish whether
     /// their config was ignored at compile time or broken at runtime.
     #[cfg(feature = "parakeet")]

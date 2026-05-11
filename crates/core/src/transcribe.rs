@@ -221,13 +221,12 @@ impl DecodeHints {
         self.priority_phrases
             .iter()
             .take(8)
-            .cloned()
-            .into_iter()
-            .filter(|phrase| {
+            .filter(|&phrase| {
                 let has_digit = phrase.chars().any(|c| c.is_ascii_digit());
                 let token_count = phrase.split_whitespace().count();
                 has_digit || token_count > 1
             })
+            .cloned()
             .collect()
     }
 }
@@ -2027,6 +2026,7 @@ fn parakeet_gpu_unavailable(stderr: &str) -> bool {
 }
 
 #[cfg(feature = "parakeet")]
+#[allow(clippy::too_many_arguments)]
 fn build_parakeet_command(
     binary: &str,
     model_str: &str,
@@ -2065,6 +2065,7 @@ fn build_parakeet_command(
 }
 
 #[cfg(feature = "parakeet")]
+#[allow(clippy::too_many_arguments)]
 fn run_parakeet_command_with_cpu_fallback(
     binary: &str,
     model_str: &str,
@@ -2229,6 +2230,7 @@ fn log_parakeet_helper_spawn_failure_once(error: &std::io::Error) {
 }
 
 #[cfg(feature = "parakeet")]
+#[allow(clippy::too_many_arguments)]
 pub fn run_parakeet_cli_structured(
     binary: &str,
     model_path: &Path,
@@ -2272,6 +2274,7 @@ pub fn run_parakeet_cli_structured(
 }
 
 #[cfg(feature = "parakeet")]
+#[allow(clippy::too_many_arguments)]
 pub fn run_parakeet_cli_structured_batch(
     binary: &str,
     model_path: &Path,
@@ -2682,9 +2685,11 @@ pub fn transcribe_parakeet_batch(
             continue;
         }
 
-        let mut stats = FilterStats::default();
-        stats.audio_duration_secs = samples.len() as f64 / 16000.0;
-        stats.samples_after_silence_strip = samples.len();
+        let stats = FilterStats {
+            audio_duration_secs: samples.len() as f64 / 16000.0,
+            samples_after_silence_strip: samples.len(),
+            ..Default::default()
+        };
         stats_per_file.push(Ok(stats));
     }
 
@@ -2705,7 +2710,7 @@ pub fn transcribe_parakeet_batch(
 
     Ok(parsed_batch
         .into_iter()
-        .zip(stats_per_file.into_iter())
+        .zip(stats_per_file)
         .map(|(parsed, stats)| match (parsed, stats) {
             (_, Err(error)) => Err(error),
             (Err(error), Ok(_)) => Err(error),

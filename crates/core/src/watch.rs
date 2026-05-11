@@ -398,7 +398,7 @@ fn process_parakeet_memo_batch(
         .checked_div(candidates.len() as u64)
         .unwrap_or(0);
 
-    for (candidate, transcribe_result) in candidates.iter().zip(batch_results.into_iter()) {
+    for (candidate, transcribe_result) in candidates.iter().zip(batch_results) {
         let transcribe_result = match transcribe_result {
             Ok(result) => result,
             Err(error) => {

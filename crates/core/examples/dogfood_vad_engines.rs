@@ -343,7 +343,7 @@ fn find_recent_meeting_wavs(count: usize) -> Result<Vec<PathBuf>, Box<dyn std::e
             Some((m, e.path()))
         })
         .collect();
-    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     Ok(entries.into_iter().take(count).map(|(_, p)| p).collect())
 }
 
