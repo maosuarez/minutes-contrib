@@ -6452,6 +6452,7 @@ pub fn cmd_get_meeting_detail(path: String) -> Result<MeetingDetail, String> {
             minutes_core::markdown::OutputStatus::Complete => "complete",
             minutes_core::markdown::OutputStatus::NoSpeech => "no-speech",
             minutes_core::markdown::OutputStatus::TranscriptOnly => "transcript-only",
+            minutes_core::markdown::OutputStatus::Degraded => "degraded",
         }
         .to_string()
     });
@@ -9692,6 +9693,7 @@ mod tests {
             template: None,
             filter_diagnosis: None,
             recording_health: None,
+            processing_warnings: Vec::new(),
         };
         let sections = vec![MeetingSection {
             heading: "Summary".into(),
@@ -9749,6 +9751,7 @@ mod tests {
             template: None,
             filter_diagnosis: None,
             recording_health: None,
+            processing_warnings: Vec::new(),
         };
         let sections = vec![MeetingSection {
             heading: "Summary".into(),
@@ -9797,6 +9800,7 @@ mod tests {
             template: None,
             filter_diagnosis: None,
             recording_health: None,
+            processing_warnings: Vec::new(),
         };
         let sections = vec![MeetingSection {
             heading: "Summary".into(),

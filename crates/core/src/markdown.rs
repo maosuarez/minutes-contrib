@@ -30,6 +30,30 @@ pub enum OutputStatus {
     Complete,
     NoSpeech,
     TranscriptOnly,
+    /// Transcription completed but one or more summarization-side steps
+    /// fell back to empty output (e.g. agent timeout, empty summary).
+    /// Per-step failures are recorded in [`Frontmatter::processing_warnings`].
+    Degraded,
+}
+
+/// A non-fatal failure of a post-transcript pipeline step.
+///
+/// When any step degrades, the meeting's [`OutputStatus`] is promoted to
+/// [`OutputStatus::Degraded`] and the failure context is appended here so
+/// the markdown is honest about what is missing. Files are then greppable
+/// for "what needs re-running" (`status: degraded` in frontmatter).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ProcessingWarning {
+    /// The pipeline step that produced the warning.
+    pub step: String,
+    /// Machine-readable failure reason (e.g. `agent_timeout`, `empty_output`).
+    pub reason: String,
+    /// For timeout reasons, the budget that was exceeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// Optional human-readable detail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -126,6 +150,11 @@ pub struct Frontmatter {
     pub source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<OutputStatus>,
+    /// Per-step failure context when [`OutputStatus::Degraded`] applies.
+    /// Skipped from serialization when empty so successful runs do not
+    /// emit extra frontmatter noise. See issue #243.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub processing_warnings: Vec<ProcessingWarning>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -879,6 +908,7 @@ mod tests {
             visibility: None,
             speaker_map: vec![],
             recording_health: None,
+            processing_warnings: Vec::new(),
             template: None,
             filter_diagnosis: None,
         }
@@ -1024,6 +1054,56 @@ mod tests {
 
         assert_eq!(reparsed.recording_health, frontmatter.recording_health);
         assert_eq!(split_frontmatter(&output).1.as_bytes(), body.as_bytes());
+    }
+
+    #[test]
+    fn processing_warnings_roundtrip_through_yaml() {
+        // Issue #243: degraded status + processing_warnings must serialize
+        // to YAML and round-trip back through deserialization without loss.
+        // Codex review of PR #249 v1 flagged missing end-to-end coverage.
+        let input = "---\ntitle: Failed Summary Meeting\ntype: meeting\ndate: 2026-04-01T10:00:00-07:00\nduration: 45m\nstatus: degraded\nprocessing_warnings:\n  - step: summarize\n    reason: summarize_failed\n    timeout_secs: 300\n    message: Summarization via agent `opencode` produced no output.\n---\n\n## Transcript\n\nHello.\n";
+        let (fm, body) = split_frontmatter(input);
+        let frontmatter: Frontmatter = serde_yaml::from_str(fm).unwrap();
+
+        assert_eq!(frontmatter.status, Some(OutputStatus::Degraded));
+        assert_eq!(frontmatter.processing_warnings.len(), 1);
+        let w = &frontmatter.processing_warnings[0];
+        assert_eq!(w.step, "summarize");
+        assert_eq!(w.reason, "summarize_failed");
+        assert_eq!(w.timeout_secs, Some(300));
+        assert!(w.message.as_ref().unwrap().contains("opencode"));
+
+        // Round-trip the structure through serde -> string -> serde and
+        // assert the deserialized form is identical.
+        let yaml = serde_yaml::to_string(&frontmatter).unwrap();
+        let output = format!("---\n{}---\n{}", yaml, body);
+        let (reparsed_fm, reparsed_body) = split_frontmatter(&output);
+        let reparsed: Frontmatter = serde_yaml::from_str(reparsed_fm).unwrap();
+        assert_eq!(reparsed.status, frontmatter.status);
+        assert_eq!(
+            reparsed.processing_warnings,
+            frontmatter.processing_warnings
+        );
+        assert_eq!(reparsed_body.as_bytes(), body.as_bytes());
+
+        // Verify the serialized YAML actually contains the kebab-case
+        // discriminant and the array (rather than skipping due to empty).
+        assert!(yaml.contains("status: degraded"));
+        assert!(yaml.contains("processing_warnings:"));
+        assert!(yaml.contains("step: summarize"));
+    }
+
+    #[test]
+    fn processing_warnings_omitted_when_empty() {
+        // Empty processing_warnings must not appear in the serialized
+        // YAML so successful runs don't pick up extra frontmatter noise.
+        let input = "---\ntitle: Normal Meeting\ntype: meeting\ndate: 2026-04-01T10:00:00-07:00\nduration: 5m\nstatus: complete\n---\n\n## Transcript\n\nHello.\n";
+        let (fm, _) = split_frontmatter(input);
+        let frontmatter: Frontmatter = serde_yaml::from_str(fm).unwrap();
+        assert!(frontmatter.processing_warnings.is_empty());
+
+        let yaml = serde_yaml::to_string(&frontmatter).unwrap();
+        assert!(!yaml.contains("processing_warnings"));
     }
 
     #[test]
