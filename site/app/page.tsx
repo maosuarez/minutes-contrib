@@ -304,11 +304,14 @@ export default function Home() {
         </p>
 
         <p className="mx-auto mt-4 max-w-[620px] text-[14px] leading-6 text-[var(--text-secondary)]">
-          v{MINUTES_RELEASE_VERSION} fixes the stale processing-recovery loop:
-          dismissed failed-capture notices now stay dismissed after restart,
-          while retry still clears the dismissal marker for a fresh attempt.
-          It also carries forward the active-recording status polling fix that
-          keeps desktop calls from piling up while audio capture is running.
+          v{MINUTES_RELEASE_VERSION} stops Minutes from writing
+          plausible-looking transcripts that aren't real: macOS native-call
+          captures no longer transcribe to 2x duration garble, near-silent
+          recordings stop emitting &ldquo;(crying)&rdquo; as if it were
+          speech, long silent tails stop filling with YouTube hallucinations,
+          and summarization timeouts now show as{" "}
+          <code className="font-mono text-[12px]">status: degraded</code>{" "}
+          instead of looking complete.
         </p>
 
         <div className="mt-12">
