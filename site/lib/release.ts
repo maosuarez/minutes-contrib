@@ -5,7 +5,7 @@
 export const MINUTES_RELEASE_VERSION = "0.18.3";
 export const MINUTES_RELEASE_TAG = `v${MINUTES_RELEASE_VERSION}`;
 
-export const MINUTES_MCP_TOOL_COUNT = 29;
+export const MINUTES_MCP_TOOL_COUNT = 31;
 export const MINUTES_CLI_COMMAND_COUNT = 52;
 export const MINUTES_TEST_COUNT = 1129;
 
