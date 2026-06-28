@@ -1245,7 +1245,7 @@ fn transcribe_with_whisper(
     let detected_language = {
         let lang_id = state.full_lang_id_from_state();
         if lang_id >= 0 {
-            whisper_rs::get_lang_str(lang_id as i32).map(str::to_owned)
+            whisper_rs::get_lang_str(lang_id).map(str::to_owned)
         } else {
             None
         }
